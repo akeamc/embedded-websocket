@@ -1,6 +1,6 @@
 use core::{fmt::Debug, ops::Deref, str::Utf8Error};
 
-use futures::{Sink, SinkExt, Stream, StreamExt};
+use embedded_io_async::{Error, Read, Write};
 use rand_core::RngCore;
 
 use crate::{
@@ -30,7 +30,7 @@ pub enum ReadResult<'a> {
 }
 
 #[derive(Debug)]
-pub enum FramerError<E> {
+pub enum FramerError<E: Error> {
     Io(E),
     FrameTooLarge(usize),
     Utf8(Utf8Error),
@@ -38,6 +38,12 @@ pub enum FramerError<E> {
     WebSocket(crate::Error),
     Disconnected,
     RxBufferTooSmall(usize),
+}
+
+impl<E: Error> From<E> for FramerError<E> {
+    fn from(error: E) -> Self {
+        Self::Io(error)
+    }
 }
 
 pub struct Framer<TRng, TWebSocketType>
@@ -54,9 +60,9 @@ impl<TRng> Framer<TRng, crate::Client>
 where
     TRng: RngCore,
 {
-    pub async fn connect<'a, B, E>(
+    pub async fn connect<'a, B, E: embedded_io_async::Error>(
         &mut self,
-        stream: &mut (impl Stream<Item = Result<B, E>> + Sink<&'a [u8], Error = E> + Unpin),
+        stream: impl Read<Error = E> + Write<Error = E>,
         buffer: &'a mut [u8],
         websocket_options: &WebSocketOptions<'_>,
     ) -> Result<Option<WebSocketSubProtocol>, FramerError<E>>
@@ -69,12 +75,16 @@ where
             .map_err(FramerError::WebSocket)?;
 
         let (tx_buf, rx_buf) = buffer.split_at_mut(tx_len);
-        stream.send(tx_buf).await.map_err(FramerError::Io)?;
-        stream.flush().await.map_err(FramerError::Io)?;
+        stream.write_all(tx_buf).await?;
+        stream.flush().await?;
 
         loop {
-            match stream.next().await {
-                Some(buf) => {
+            let n_read = stream.read(&mut rx_buf).await?;
+    
+            if n_read == 0 {
+                return Err(FramerError::Disconnected);
+            }
+
                     let buf = buf.map_err(FramerError::Io)?;
                     let buf = buf.as_ref();
 
@@ -104,8 +114,6 @@ where
                             return Err(FramerError::WebSocket(e));
                         }
                     }
-                }
-                None => return Err(FramerError::Disconnected),
             }
         }
     }
@@ -184,9 +192,9 @@ where
     // of the buffer to be used next time this read function is called. This also applies to
     // any unused bytes read when the connect handshake was made. Therefore it is important that
     // the caller does not clear this buffer between calls or use it for anthing other than reads.
-    pub async fn read<'a, B: Deref<Target = [u8]>, E>(
+    pub async fn read<'a, B: Deref<Target = [u8]>, E: Error>(
         &mut self,
-        stream: &mut (impl Stream<Item = Result<B, E>> + Sink<&'a [u8], Error = E> + Unpin),
+        stream: impl Read<Error = E> + Write<Error = E>,
         buffer: &'a mut [u8],
     ) -> Option<Result<ReadResult<'a>, FramerError<E>>>
     where
